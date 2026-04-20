@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎤 Song Lyrics</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+    <div class="lyrics-header">
+        <span class="icon">&#127908;</span>
+        <div>
+            <h1 id="headerTitle">Song Lyrics</h1>
+            <div class="meta" id="headerMeta"></div>
+        </div>
+    </div>
+
+    <div class="lyrics-container">
+        <div class="lyrics-info">
+            <img class="lyrics-cover" id="lyricsCover" src="" alt="Album cover" onerror="this.style.display='none'">
+            <div class="lyrics-info-text">
+                <div class="song-title" id="songTitle">Loading…</div>
+                <div class="song-artist" id="songArtist"></div>
+                <div class="song-album" id="songAlbum"></div>
+            </div>
+        </div>
+
+        <div id="viewMode">
+            <div class="lyrics-display" id="lyricsDisplay">
+                <span class="loading-text">Loading lyrics…</span>
+            </div>
+            <div class="lyrics-actions">
+                <button class="btn btn-primary" id="btnEdit">&#9998; Edit Lyrics</button>
+                <button class="btn btn-accent" id="btnFetchWeb">&#127760; Fetch from Web</button>
+            </div>
+            <div class="status-msg" id="fetchStatus"></div>
+        </div>
+
+        <div id="editMode" style="display:none">
+            <textarea class="lyrics-editor" id="lyricsEditor" placeholder="Paste or type lyrics here…"></textarea>
+            <div class="lyrics-actions">
+                <button class="btn btn-primary" id="btnSave">&#128190; Save</button>
+                <button class="btn btn-ghost" id="btnCancelEdit">Cancel</button>
+            </div>
+            <div class="status-msg" id="statusMsg"></div>
+        </div>
+    </div>
+
+    <script src="js/lyrics.js"></script>
+</body>
+</html>
