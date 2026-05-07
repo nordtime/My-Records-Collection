@@ -29,12 +29,55 @@ require_once __DIR__ . '/db.php';
 define('DISCOGS_TOKEN_FILE', __DIR__ . '/discogs_token.txt');
 define('DISCOGS_RATE_FILE', sys_get_temp_dir() . '/records_discogs_rate.json');
 define('DISCOGS_RATE_LIMIT', 30);  // max Discogs requests per minute (half of Discogs's 60 to stay safe)
+define('API_RATE_FILE', sys_get_temp_dir() . '/records_api_rate.json');
+define('OPS_LOG_DIR', __DIR__ . '/../logs');
+define('OPS_UPTIME_LOG', OPS_LOG_DIR . '/api_uptime.log');
+define('OPS_ERROR_LOG', OPS_LOG_DIR . '/api_errors.log');
 
-$method = $_SERVER['REQUEST_METHOD'];
+$requestStart = microtime(true);
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$clientIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+$requestPath = $_SERVER['REQUEST_URI'] ?? '';
+
+try {
+    $requestId = bin2hex(random_bytes(6));
+} catch (\Throwable) {
+    $requestId = substr(sha1(uniqid('', true)), 0, 12);
+}
+
+header('X-Request-Id: ' . $requestId);
+
+register_shutdown_function(function () use ($requestStart, $requestId, $method, $requestPath, $clientIp): void {
+    $status = http_response_code();
+    if (!$status) $status = 200;
+    $durationMs = round((microtime(true) - $requestStart) * 1000, 2);
+
+    opsLog(OPS_UPTIME_LOG, [
+        'ts' => gmdate('c'),
+        'request_id' => $requestId,
+        'method' => $method,
+        'path' => $requestPath,
+        'ip' => $clientIp,
+        'status' => $status,
+        'duration_ms' => $durationMs,
+    ]);
+});
 
 // Handle CORS preflight
 if ($method === 'OPTIONS') {
     http_response_code(204);
+    exit;
+}
+
+if (!checkApiRateLimit('global:' . $clientIp, 300, 60)) {
+    http_response_code(429);
+    echo json_encode(['error' => 'API request limit reached. Please wait and retry.', 'request_id' => $requestId]);
+    exit;
+}
+
+if (in_array($method, ['POST', 'PUT', 'DELETE'], true) && !checkApiRateLimit('write:' . $clientIp, 90, 60)) {
+    http_response_code(429);
+    echo json_encode(['error' => 'Write request limit reached. Please wait and retry.', 'request_id' => $requestId]);
     exit;
 }
 
@@ -44,6 +87,15 @@ try {
     switch ($method) {
         // ── READ ────────────────────────────────────────────
         case 'GET':
+            if (isset($_GET['health'])) {
+                echo json_encode([
+                    'status' => 'ok',
+                    'time' => gmdate('c'),
+                    'request_id' => $requestId,
+                ]);
+                break;
+            }
+
             // Stats endpoint
             if (isset($_GET['stats'])) {
                 handleStats($pdo);
@@ -52,21 +104,36 @@ try {
 
             // MusicBrainz lookup endpoint
             if (isset($_GET['lookup'])) {
+                if (!checkApiRateLimit('lookup:' . $clientIp, 40, 60)) {
+                    http_response_code(429);
+                    echo json_encode(['error' => 'Lookup rate limit reached. Please wait and retry.', 'request_id' => $requestId]);
+                    break;
+                }
                 handleLookup();
                 break;
             }
 
             // MusicBrainz track list endpoint
             if (isset($_GET['tracks'])) {
+                if (!checkApiRateLimit('tracks:' . $clientIp, 50, 60)) {
+                    http_response_code(429);
+                    echo json_encode(['error' => 'Track lookup limit reached. Please wait and retry.', 'request_id' => $requestId]);
+                    break;
+                }
                 handleTracks($pdo);
                 break;
             }
 
             // Discogs valuation endpoint
             if (isset($_GET['discogs'])) {
+                if (!checkApiRateLimit('discogs:' . $clientIp, 30, 60)) {
+                    http_response_code(429);
+                    echo json_encode(['error' => 'Discogs request limit reached. Please wait and retry.', 'request_id' => $requestId]);
+                    break;
+                }
                 if (!checkDiscogsRateLimit()) {
                     http_response_code(429);
-                    echo json_encode(['error' => 'Discogs rate limit reached. Please wait a minute.']);
+                    echo json_encode(['error' => 'Discogs rate limit reached. Please wait a minute.', 'request_id' => $requestId]);
                     break;
                 }
                 if ($_GET['discogs'] === 'valuate_all') {
@@ -85,6 +152,11 @@ try {
             // With &fetch=1, fetches lyrics from the web instead of DB
             if (isset($_GET['lyrics'])) {
                 if (isset($_GET['fetch'])) {
+                    if (!checkApiRateLimit('lyrics-fetch:' . $clientIp, 30, 60)) {
+                        http_response_code(429);
+                        echo json_encode(['error' => 'Lyrics fetch limit reached. Please wait and retry.', 'request_id' => $requestId]);
+                        break;
+                    }
                     handleFetchLyricsFromWeb();
                 } else {
                     handleGetLyrics($pdo);
@@ -180,10 +252,10 @@ try {
                 break;
             }
 
-            // Duplicate check (artist + album, case-insensitive)
+            // Duplicate check (artist + album + format, case-insensitive)
             $force = isset($_GET['force']) && $_GET['force'] === '1';
             if (!$force) {
-                $dup = findDuplicate($pdo, trim($data['artist']), trim($data['album']));
+                $dup = findDuplicate($pdo, trim($data['artist']), trim($data['album']), $data['format'] ?? 'Vinyl');
                 if ($dup) {
                     http_response_code(409);
                     echo json_encode([
@@ -239,6 +311,11 @@ try {
                 break;
             }
 
+            // Fetch old record before update for cache invalidation
+            $stmt = $pdo->prepare('SELECT artist, album FROM records WHERE id = :id');
+            $stmt->execute([':id' => $id]);
+            $oldAlbum = $stmt->fetch();
+
             $coverUrl = cacheCoverUrl($data['cover_url'] ?? '');
 
             $stmt = $pdo->prepare('
@@ -276,10 +353,19 @@ try {
                     echo json_encode(['message' => 'Record updated.']);
                 }
             } else {
-                // Record changed — invalidate Discogs cache so it re-fetches with new info
+                // Record changed — invalidate caches so it re-fetches with new info
                 try {
                     ensureDiscogsCacheTable($pdo);
                     $pdo->prepare('DELETE FROM discogs_cache WHERE record_id = :rid')->execute([':rid' => $id]);
+
+                    // Invalidate track_cache for old AND new artist/album
+                    ensureTrackCacheTable($pdo);
+                    if ($oldAlbum) {
+                        $oldCacheKey = mb_strtolower(trim($oldAlbum['artist']) . '||' . trim($oldAlbum['album']));
+                        $pdo->prepare('DELETE FROM track_cache WHERE cache_key = ?')->execute([$oldCacheKey]);
+                    }
+                    $newCacheKey = mb_strtolower(trim($data['artist']) . '||' . trim($data['album']));
+                    $pdo->prepare('DELETE FROM track_cache WHERE cache_key = ?')->execute([$newCacheKey]);
                 } catch (\Throwable $e) {
                     // Non-critical — cache will expire naturally
                 }
@@ -334,15 +420,79 @@ try {
     }
 } catch (\Throwable $e) {
     error_log('[Records API] ' . get_class($e) . ': ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+    opsLog(OPS_ERROR_LOG, [
+        'ts' => gmdate('c'),
+        'request_id' => $requestId,
+        'method' => $method,
+        'path' => $requestPath,
+        'ip' => $clientIp,
+        'error_class' => get_class($e),
+        'error_message' => $e->getMessage(),
+        'file' => $e->getFile(),
+        'line' => $e->getLine(),
+    ]);
     http_response_code(500);
-    echo json_encode(['error' => 'Internal server error.']);
+    echo json_encode(['error' => 'Internal server error.', 'request_id' => $requestId]);
 }
 
 // ── Helpers ──────────────────────────────────────────────────
 
-function findDuplicate(PDO $pdo, string $artist, string $album, ?int $excludeId = null): ?array {
-    $sql = 'SELECT id, artist, album FROM records WHERE LOWER(artist) = LOWER(:artist) AND LOWER(album) = LOWER(:album)';
-    $params = [':artist' => $artist, ':album' => $album];
+function opsLog(string $filePath, array $payload): void {
+    try {
+        if (!is_dir(OPS_LOG_DIR)) {
+            @mkdir(OPS_LOG_DIR, 0755, true);
+        }
+        $line = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($line !== false) {
+            @file_put_contents($filePath, $line . PHP_EOL, FILE_APPEND | LOCK_EX);
+        }
+    } catch (\Throwable) {
+        // Logging must never break API responses.
+    }
+}
+
+function checkApiRateLimit(string $bucket, int $maxRequests, int $windowSeconds = 60): bool {
+    $now = time();
+    $store = ['buckets' => []];
+
+    if (is_file(API_RATE_FILE)) {
+        $raw = @file_get_contents(API_RATE_FILE);
+        if ($raw !== false) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $store = $decoded;
+            }
+        }
+    }
+
+    $store['buckets'] ??= [];
+    $timestamps = $store['buckets'][$bucket] ?? [];
+    $timestamps = array_values(array_filter($timestamps, fn($ts) => ($now - (int) $ts) < $windowSeconds));
+
+    if (count($timestamps) >= $maxRequests) {
+        return false;
+    }
+
+    $timestamps[] = $now;
+    $store['buckets'][$bucket] = $timestamps;
+
+    // Keep only recent buckets to prevent unbounded growth.
+    foreach ($store['buckets'] as $key => $list) {
+        $recent = array_values(array_filter((array) $list, fn($ts) => ($now - (int) $ts) < ($windowSeconds * 2)));
+        if (empty($recent)) {
+            unset($store['buckets'][$key]);
+        } else {
+            $store['buckets'][$key] = $recent;
+        }
+    }
+
+    @file_put_contents(API_RATE_FILE, json_encode($store), LOCK_EX);
+    return true;
+}
+
+function findDuplicate(PDO $pdo, string $artist, string $album, string $format, ?int $excludeId = null): ?array {
+    $sql = 'SELECT id, artist, album, format FROM records WHERE LOWER(artist) = LOWER(:artist) AND LOWER(album) = LOWER(:album) AND format = :format';
+    $params = [':artist' => $artist, ':album' => $album, ':format' => $format];
     if ($excludeId !== null) {
         $sql .= ' AND id != :excludeId';
         $params[':excludeId'] = $excludeId;
@@ -862,16 +1012,16 @@ function handleCsvImport(PDO $pdo): void {
         }
 
         // Skip duplicates (check against existing DB records)
-        $dup = findDuplicate($pdo, $artist, $album);
-        if ($dup) {
-            $skipped++;
-            $errors[] = "Row $lineNum: duplicate of existing record #{$dup['id']} ({$dup['artist']} — {$dup['album']}).";
-            continue;
-        }
-
         $format = trim($row['format'] ?? 'Vinyl');
         if (!in_array($format, $validFormats, true)) {
             $format = 'Vinyl';
+        }
+
+        $dup = findDuplicate($pdo, $artist, $album, $format);
+        if ($dup) {
+            $skipped++;
+            $errors[] = "Row $lineNum: duplicate of existing record #{$dup['id']} ({$dup['artist']} — {$dup['album']}, {$dup['format']}).";
+            continue;
         }
 
         $year = null;
@@ -896,7 +1046,13 @@ function handleCsvImport(PDO $pdo): void {
             $imported++;
         } catch (PDOException $e) {
             $skipped++;
-            $errors[] = "Row $lineNum: " . $e->getMessage();
+            $errors[] = "Row $lineNum: unable to save record.";
+            opsLog(OPS_ERROR_LOG, [
+                'ts' => gmdate('c'),
+                'scope' => 'csv_import',
+                'line' => $lineNum,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
@@ -1144,10 +1300,29 @@ function handleFetchLyricsFromWeb(): void {
 
 function handleStats(PDO $pdo): void {
     $total      = $pdo->query('SELECT COUNT(*) FROM records')->fetchColumn();
+    $byArtist   = $pdo->query('SELECT artist, COUNT(*) as count FROM records WHERE artist != "" GROUP BY artist ORDER BY count DESC LIMIT 8')->fetchAll();
     $byGenre    = $pdo->query('SELECT genre, COUNT(*) as count FROM records WHERE genre != "" GROUP BY genre ORDER BY count DESC')->fetchAll();
     $byFormat   = $pdo->query('SELECT format, COUNT(*) as count FROM records GROUP BY format ORDER BY count DESC')->fetchAll();
+    $byYear     = $pdo->query('SELECT year, COUNT(*) as count FROM records WHERE year IS NOT NULL GROUP BY year ORDER BY year')->fetchAll();
+    $byCondition = $pdo->query('SELECT condition_grade AS `condition`, COUNT(*) as count FROM records WHERE condition_grade != "" GROUP BY condition_grade ORDER BY count DESC')->fetchAll();
     $byDecade   = $pdo->query('SELECT FLOOR(year/10)*10 AS decade, COUNT(*) as count FROM records WHERE year IS NOT NULL GROUP BY decade ORDER BY decade')->fetchAll();
     $latest     = $pdo->query('SELECT artist, album, date_added FROM records ORDER BY date_added DESC LIMIT 5')->fetchAll();
+
+    $growthRows = $pdo->query('SELECT DATE_FORMAT(date_added, "%Y-%m") AS month, COUNT(*) as added FROM records WHERE date_added IS NOT NULL GROUP BY month ORDER BY month ASC')->fetchAll();
+    $growth = [];
+    $runningTotal = 0;
+    foreach ($growthRows as $row) {
+        $added = (int) ($row['added'] ?? 0);
+        $runningTotal += $added;
+        $growth[] = [
+            'month' => $row['month'],
+            'added' => $added,
+            'total' => $runningTotal,
+        ];
+    }
+    if (count($growth) > 12) {
+        $growth = array_slice($growth, -12);
+    }
 
     // Aggregate Discogs valuation data from cache
     $valuation = null;
@@ -1179,9 +1354,13 @@ function handleStats(PDO $pdo): void {
 
     echo json_encode([
         'total'      => (int) $total,
+        'by_artist'  => $byArtist,
         'by_genre'   => $byGenre,
         'by_format'  => $byFormat,
+        'by_year'    => $byYear,
+        'by_condition' => $byCondition,
         'by_decade'  => $byDecade,
+        'growth'     => $growth,
         'latest'     => $latest,
         'valuation'  => $valuation,
     ]);

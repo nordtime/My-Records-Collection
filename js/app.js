@@ -20,6 +20,12 @@
     const $modalTitle   = document.getElementById('modalTitle');
     const $form         = document.getElementById('recordForm');
     const $recordId     = document.getElementById('recordId');
+    const $btnSave      = document.getElementById('btnSave');
+    const $artistInput  = document.getElementById('artist');
+    const $albumInput   = document.getElementById('album');
+    const $formatInput  = document.getElementById('format');
+    const $duplicateHint = document.getElementById('duplicateHint');
+    const $optionalDetails = document.getElementById('optionalDetails');
 
     const $statsOverlay = document.getElementById('statsOverlay');
     const $statsBody    = document.getElementById('statsBody');
@@ -32,6 +38,10 @@
     const $deleteName    = document.getElementById('deleteName');
 
     const $toast = document.getElementById('toast');
+    const $backupReminder = document.getElementById('backupReminder');
+    const $backupReminderText = document.getElementById('backupReminderText');
+    const $undoBar = document.getElementById('undoBar');
+    const $undoText = document.getElementById('undoText');
 
     let deleteTargetId = null;
     let deleteTargetIds = [];       // multi-select delete
@@ -40,19 +50,34 @@
     let debounceTimer  = null;
     let knownGenres    = new Set();
     let csvParsedRows  = [];
+    let csvPreviewRows = [];
+    let csvImportIssues = [];
+    let loadRequestToken = 0;
+    let duplicateCheckTimer = null;
+    let allRecordsCache = null;
+    let allRecordsCacheAt = 0;
+    let toastTimer = null;
+    let lastDeletedPayloads = null;
+    let undoDeleteTimer = null;
+
+    const ALL_RECORDS_CACHE_TTL_MS = 20000;
+    const BACKUP_REMINDER_DAYS = 7;
+    const IMPORT_VALID_FORMATS = ['Vinyl', 'CD', 'Cassette', 'Digital'];
 
     const $importOverlay  = document.getElementById('importOverlay');
     const $importPreview  = document.getElementById('importPreview');
     const $previewTable   = document.getElementById('previewTable');
     const $previewTitle   = document.getElementById('previewTitle');
+    const $importErrors   = document.getElementById('importErrors');
     const $csvFileInput   = document.getElementById('csvFileInput');
     const $dropZone       = document.getElementById('dropZone');
     const $btnConfirmImport = document.getElementById('btnConfirmImport');
 
     // ── Init ────────────────────────────────────────────────
     document.addEventListener('DOMContentLoaded', () => {
-        loadRecords();
         bindEvents();
+        maybeShowBackupReminder();
+        loadRecords();
     });
 
     // ── Events ──────────────────────────────────────────────
@@ -77,6 +102,9 @@
 
         // Form submit
         $form.addEventListener('submit', handleSave);
+        $artistInput.addEventListener('input', queueDuplicateCheck);
+        $albumInput.addEventListener('input', queueDuplicateCheck);
+        $formatInput.addEventListener('change', queueDuplicateCheck);
 
         // Lookup
         document.getElementById('btnLookup').addEventListener('click', handleLookup);
@@ -102,6 +130,8 @@
 
         // CSV Export
         document.getElementById('btnExportCsv').addEventListener('click', handleExportCsv);
+        document.getElementById('btnBackupNow').addEventListener('click', handleBackupNow);
+        document.getElementById('btnDismissBackupReminder').addEventListener('click', dismissBackupReminder);
 
         // CSV Import
         document.getElementById('btnImportCsv').addEventListener('click', openImportModal);
@@ -124,6 +154,10 @@
             e.preventDefault();
             downloadCsvTemplate();
         });
+
+        // Undo delete
+        document.getElementById('btnUndoDelete').addEventListener('click', handleUndoDelete);
+        document.getElementById('btnDismissUndo').addEventListener('click', hideUndoBar);
 
         // Keyboard: Escape to close modals
         document.addEventListener('keydown', e => {
@@ -149,29 +183,33 @@
     async function apiFetch(url, opts = {}) {
         try {
             const res = await fetch(url, opts);
+            const requestId = res.headers.get('X-Request-Id') || '';
             const text = await res.text();
             let data;
             try {
                 data = JSON.parse(text);
             } catch {
-                const err = new Error('Server returned invalid response.');
+                const err = new Error('The server returned an unreadable response.');
                 err.status = res.status;
+                err.requestId = requestId;
                 throw err;
             }
             if (!res.ok) {
                 const err = new Error(data.error || data.errors?.join(', ') || 'Request failed.');
                 err.status = res.status;
                 err.duplicate = data.duplicate || null;
+                err.requestId = data.request_id || requestId || null;
                 throw err;
             }
             return data;
         } catch (err) {
+            const message = formatApiErrorMessage(err);
             if (!err.status) {
                 // Network / parse error — show toast
-                showToast(err.message, 'error');
+                showToast(message, 'error');
             } else if (err.status !== 409) {
                 // Non-duplicate API error — show toast
-                showToast(err.message, 'error');
+                showToast(message, 'error');
             }
             throw err;
         }
@@ -185,17 +223,38 @@
         if ($format.value)        params.set('format', $format.value);
         params.set('sort', $sort.value);
 
+        const requestToken = ++loadRequestToken;
+        showGridSkeletons();
+
         try {
             const records = await apiFetch(`${API}?${params}`);
+            if (requestToken !== loadRequestToken) return;
             currentRecords = records;
+            if (!$search.value.trim() && !$genre.value && !$format.value) {
+                allRecordsCache = records;
+                allRecordsCacheAt = Date.now();
+            }
             renderRecords(records);
             updateGenreFilter(records);
+            maybeShowBackupReminder(records.length);
         } catch {
+            if (requestToken !== loadRequestToken) return;
+            $grid.classList.remove('is-loading');
+            if (currentRecords.length) {
+                renderRecords(currentRecords);
+            } else {
+                $grid.classList.add('hidden');
+                $grid.innerHTML = '';
+                $empty.classList.add('hidden');
+                $count.textContent = 'Failed to load records.';
+            }
             // error already toasted
         }
     }
 
     function renderRecords(records) {
+        $grid.classList.remove('is-loading');
+
         if (!records.length) {
             $grid.innerHTML = '';
             $grid.classList.add('hidden');
@@ -213,11 +272,12 @@
                 ? escHtml(r.cover_url)
                 : `${COVER_API}?artist=${encodeURIComponent(r.artist)}&album=${encodeURIComponent(r.album)}`;
             const isSelected = selectedIds.has(r.id);
+            const openLabel = `Open track list for ${r.artist} - ${r.album}`;
             return `
-            <div class="record-card${isSelected ? ' selected' : ''}" data-id="${r.id}">
+            <div class="record-card${isSelected ? ' selected' : ''}" data-id="${r.id}" tabindex="0" role="button" aria-label="${escHtml(openLabel)}">
                 <div class="card-cover">
-                    <input type="checkbox" class="card-select" data-id="${r.id}" ${isSelected ? 'checked' : ''} title="Select for bulk actions">
-                    <img src="${coverSrc}" alt="${escHtml(r.album)}" loading="lazy" onerror="this.parentElement.innerHTML='<input type=checkbox class=card-select data-id=${r.id} ${isSelected ? 'checked' : ''} title=Select><span class=\'cover-placeholder\'>&#127926;</span>'">
+                    <input type="checkbox" class="card-select" data-id="${r.id}" ${isSelected ? 'checked' : ''} title="Select for bulk actions" aria-label="Select ${escHtml(r.artist)} - ${escHtml(r.album)}">
+                    <img src="${coverSrc}" alt="${escHtml(r.album)}" loading="lazy" decoding="async" fetchpriority="low" onerror="this.parentElement.innerHTML='<input type=checkbox class=card-select data-id=${r.id} ${isSelected ? 'checked' : ''} title=Select><span class=\'cover-placeholder\'>&#127926;</span>'">
                 </div>
                 <div class="card-body">
                     <div class="card-artist">${escHtml(r.artist)}</div>
@@ -231,10 +291,10 @@
                     ${r.notes ? `<div class="card-notes">${escHtml(r.notes)}</div>` : ''}
                 </div>
                 <div class="card-actions">
-                    <a class="btn btn-ghost btn-sm btn-spotify" href="https://open.spotify.com/search/${encodeURIComponent(r.artist + ' ' + r.album)}" target="_blank" rel="noopener noreferrer" title="Find on Spotify" onclick="event.stopPropagation()"><svg class="spotify-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg></a>
-                    <button class="btn btn-ghost btn-sm btn-value" data-id="${r.id}" title="Discogs Value">&#128176; Value</button>
-                    <button class="btn btn-ghost btn-sm btn-edit" data-id="${r.id}" title="Edit">&#9998; Edit</button>
-                    <button class="btn btn-ghost btn-sm btn-delete" data-id="${r.id}" title="Delete">&#128465; Delete</button>
+                    <a class="btn btn-ghost btn-sm btn-spotify" href="https://open.spotify.com/search/${encodeURIComponent(r.artist + ' ' + r.album)}" target="_blank" rel="noopener noreferrer" title="Find on Spotify" aria-label="Find ${escHtml(r.artist)} - ${escHtml(r.album)} on Spotify" onclick="event.stopPropagation()"><svg class="spotify-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg></a>
+                    <button class="btn btn-ghost btn-sm btn-value" data-id="${r.id}" title="Discogs Value" aria-label="View Discogs value for ${escHtml(r.artist)} - ${escHtml(r.album)}">&#128176; Value</button>
+                    <button class="btn btn-ghost btn-sm btn-edit" data-id="${r.id}" title="Edit" aria-label="Edit ${escHtml(r.artist)} - ${escHtml(r.album)}">&#9998; Edit</button>
+                    <button class="btn btn-ghost btn-sm btn-delete" data-id="${r.id}" title="Delete" aria-label="Delete ${escHtml(r.artist)} - ${escHtml(r.album)}">&#128465; Delete</button>
                 </div>
             </div>
         `}).join('');
@@ -272,11 +332,47 @@
         $grid.querySelectorAll('.record-card').forEach(card => {
             card.style.cursor = 'pointer';
             card.addEventListener('click', (e) => {
-                if (e.target.closest('a')) return;
+                if (e.target.closest('a,button,input,label')) return;
+                const r = records.find(rec => rec.id == card.dataset.id);
+                if (r) openTracklist(r.artist, r.album);
+            });
+            card.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                if (e.target.closest('a,button,input,label')) return;
+                e.preventDefault();
                 const r = records.find(rec => rec.id == card.dataset.id);
                 if (r) openTracklist(r.artist, r.album);
             });
         });
+    }
+
+    function showGridSkeletons(count = 6) {
+        const items = Array.from({ length: count }).map(() => `
+            <div class="record-card skeleton" aria-hidden="true">
+                <div class="card-cover"></div>
+                <div class="card-body">
+                    <div class="skeleton-line skeleton-line-lg"></div>
+                    <div class="skeleton-line skeleton-line-md"></div>
+                    <div class="skeleton-meta">
+                        <span class="skeleton-badge"></span>
+                        <span class="skeleton-badge"></span>
+                        <span class="skeleton-badge"></span>
+                    </div>
+                    <div class="skeleton-line skeleton-line-sm"></div>
+                </div>
+                <div class="card-actions skeleton-actions">
+                    <span class="skeleton-action"></span>
+                    <span class="skeleton-action"></span>
+                    <span class="skeleton-action"></span>
+                </div>
+            </div>
+        `).join('');
+
+        $empty.classList.add('hidden');
+        $grid.classList.remove('hidden');
+        $grid.classList.add('is-loading');
+        $count.textContent = 'Loading records...';
+        $grid.innerHTML = items;
     }
 
     function updateGenreFilter(records) {
@@ -294,8 +390,10 @@
         $modalTitle.textContent = 'Add Record';
         $form.reset();
         $recordId.value = '';
+        if ($optionalDetails) $optionalDetails.removeAttribute('open');
+        hideDuplicateHint();
         $modalOverlay.classList.remove('hidden');
-        document.getElementById('artist').focus();
+        $artistInput.focus();
     }
 
     // ── Edit Modal ──────────────────────────────────────────
@@ -312,7 +410,12 @@
             document.getElementById('conditionGrade').value  = r.condition_grade || '';
             document.getElementById('coverUrl').value        = r.cover_url || '';
             document.getElementById('notes').value           = r.notes || '';
+            if ($optionalDetails && (r.cover_url || r.notes)) {
+                $optionalDetails.setAttribute('open', 'open');
+            }
+            hideDuplicateHint();
             $modalOverlay.classList.remove('hidden');
+            queueDuplicateCheck();
         } catch {
             // error toasted
         }
@@ -322,9 +425,11 @@
         $modalOverlay.classList.add('hidden');
         $form.reset();
         $recordId.value = '';
+        if ($optionalDetails) $optionalDetails.removeAttribute('open');
         document.getElementById('lookupResults').classList.add('hidden');
         document.getElementById('lookupResults').innerHTML = '';
         document.getElementById('lookupStatus').classList.add('hidden');
+        hideDuplicateHint();
     }
 
     // ── MusicBrainz Lookup ──────────────────────────────────
@@ -370,7 +475,7 @@
                 <div class="lookup-card" data-idx="${i}">
                     <div class="lookup-cover">
                         ${r.cover_url
-                            ? `<img src="${escHtml(r.cover_url)}" alt="cover" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`
+                            ? `<img src="${escHtml(r.cover_url)}" alt="cover" loading="lazy" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`
                             : ''}
                         <span class="cover-placeholder" ${r.cover_url ? 'style="display:none"' : ''}>&#127926;</span>
                     </div>
@@ -400,6 +505,7 @@
                     // Use the cover art from this lookup result if available,
                     // otherwise clear so the cover proxy can resolve by artist+album
                     document.getElementById('coverUrl').value = r.cover_url || '';
+                    queueDuplicateCheck();
                     $results.classList.add('hidden');
                     $status.textContent = 'Fields filled ✓';
                     showToast(`Record info filled from ${r.source || 'lookup'}!`, 'success');
@@ -477,23 +583,123 @@
     }
 
     // ── Save (Create / Update) ──────────────────────────────
-    async function handleSave(e, force = false) {
-        e.preventDefault();
-
-        const payload = {
-            artist:          document.getElementById('artist').value,
-            album:           document.getElementById('album').value,
+    function collectRecordFormPayload() {
+        return {
+            artist:          $artistInput.value.trim(),
+            album:           $albumInput.value.trim(),
             year:            document.getElementById('year').value || null,
-            genre:           document.getElementById('genre').value,
-            format:          document.getElementById('format').value,
+            genre:           document.getElementById('genre').value.trim(),
+            format:          $formatInput.value,
             condition_grade: document.getElementById('conditionGrade').value,
-            cover_url:       document.getElementById('coverUrl').value,
-            notes:           document.getElementById('notes').value,
+            cover_url:       document.getElementById('coverUrl').value.trim(),
+            notes:           document.getElementById('notes').value.trim(),
         };
+    }
 
-        const id = $recordId.value;
+    function normalizeDuplicateValue(value) {
+        return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    }
+
+    function invalidateAllRecordsCache() {
+        allRecordsCache = null;
+        allRecordsCacheAt = 0;
+    }
+
+    async function getAllRecordsForDuplicateCheck(forceRefresh = false) {
+        const cacheIsFresh = allRecordsCache && (Date.now() - allRecordsCacheAt) < ALL_RECORDS_CACHE_TTL_MS;
+        if (!forceRefresh && cacheIsFresh) {
+            return allRecordsCache;
+        }
 
         try {
+            const res = await fetch(API, { headers: { Accept: 'application/json' } });
+            if (!res.ok) return allRecordsCache || [];
+            const data = await res.json();
+            allRecordsCache = Array.isArray(data) ? data : [];
+            allRecordsCacheAt = Date.now();
+            return allRecordsCache;
+        } catch {
+            return allRecordsCache || [];
+        }
+    }
+
+    async function findDuplicateRecord(payload, excludeId = null, forceRefresh = false) {
+        const artist = normalizeDuplicateValue(payload.artist);
+        const album = normalizeDuplicateValue(payload.album);
+        const format = normalizeDuplicateValue(payload.format || 'Vinyl');
+
+        if (!artist || !album || !format) return null;
+
+        const records = await getAllRecordsForDuplicateCheck(forceRefresh);
+        const excluded = excludeId ? Number(excludeId) : null;
+
+        return records.find(r => {
+            if (excluded && Number(r.id) === excluded) return false;
+            return (
+                normalizeDuplicateValue(r.artist) === artist
+                && normalizeDuplicateValue(r.album) === album
+                && normalizeDuplicateValue(r.format) === format
+            );
+        }) || null;
+    }
+
+    function hideDuplicateHint() {
+        if (duplicateCheckTimer) {
+            clearTimeout(duplicateCheckTimer);
+            duplicateCheckTimer = null;
+        }
+        $duplicateHint.textContent = '';
+        $duplicateHint.classList.add('hidden');
+    }
+
+    function showDuplicateHint(duplicate) {
+        if (!duplicate) {
+            hideDuplicateHint();
+            return;
+        }
+        $duplicateHint.textContent = `Duplicate found: ${duplicate.artist} — ${duplicate.album} (${duplicate.format}).`;
+        $duplicateHint.classList.remove('hidden');
+    }
+
+    async function checkForDuplicateInForm(forceRefresh = false) {
+        const payload = collectRecordFormPayload();
+        if (!payload.artist || !payload.album) {
+            hideDuplicateHint();
+            return null;
+        }
+        const duplicate = await findDuplicateRecord(payload, $recordId.value || null, forceRefresh);
+        showDuplicateHint(duplicate);
+        return duplicate;
+    }
+
+    function queueDuplicateCheck() {
+        if ($modalOverlay.classList.contains('hidden')) return;
+        if (duplicateCheckTimer) clearTimeout(duplicateCheckTimer);
+        duplicateCheckTimer = setTimeout(() => {
+            void checkForDuplicateInForm(false);
+        }, 220);
+    }
+
+    async function handleSave(e) {
+        e.preventDefault();
+
+        const payload = collectRecordFormPayload();
+        const id = $recordId.value;
+        const saveLabel = $btnSave.textContent;
+
+        $btnSave.disabled = true;
+        $btnSave.textContent = 'Saving...';
+
+        try {
+            const duplicate = await findDuplicateRecord(payload, id || null, true);
+            if (duplicate) {
+                showDuplicateHint(duplicate);
+                showToast('Duplicate record detected. Use Edit on the existing record instead.', 'error');
+                return;
+            }
+
+            hideDuplicateHint();
+
             if (id) {
                 await apiFetch(`${API}?id=${id}`, {
                     method: 'PUT',
@@ -502,28 +708,26 @@
                 });
                 showToast('Record updated!', 'success');
             } else {
-                const url = force ? `${API}?force=1` : API;
-                await apiFetch(url, {
+                await apiFetch(API, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
                 });
                 showToast('Record added!', 'success');
             }
+
+            invalidateAllRecordsCache();
             closeModal();
             loadRecords();
         } catch (err) {
-            // If duplicate detected, offer to force-add
-            if (!force && err.status === 409) {
-                const dup = err.duplicate;
-                const msg = dup
-                    ? `"${dup.artist} — ${dup.album}" already exists. Add anyway?`
-                    : 'A record with the same artist and album already exists. Add anyway?';
-                if (confirm(msg)) {
-                    handleSave(e, true);
-                }
+            if (err.status === 409) {
+                showDuplicateHint(err.duplicate || null);
+                showToast('A matching record already exists.', 'error');
             }
             // other errors already toasted by apiFetch
+        } finally {
+            $btnSave.disabled = false;
+            $btnSave.textContent = saveLabel;
         }
     }
 
@@ -556,19 +760,24 @@
         if (deleteTargetIds.length > 0) {
             const ids = [...deleteTargetIds];
             let deleted = 0;
+            const deletedPayloads = [];
             try {
                 for (const id of ids) {
                     await apiFetch(`${API}?id=${id}`, { method: 'DELETE' });
+                    const rec = currentRecords.find(r => Number(r.id) === Number(id));
+                    if (rec) deletedPayloads.push(extractRecordPayload(rec));
                     deleted++;
                 }
                 showToast(`${deleted} record${deleted !== 1 ? 's' : ''} deleted.`, 'success');
                 closeDeleteModal();
                 clearSelection();
+                queueUndoForDeleted(deletedPayloads);
                 loadRecords();
             } catch {
                 if (deleted > 0) {
                     showToast(`${deleted} of ${ids.length} deleted (some failed).`, 'error');
                     clearSelection();
+                    queueUndoForDeleted(deletedPayloads);
                     loadRecords();
                 }
             }
@@ -578,13 +787,86 @@
         // Single delete
         if (!deleteTargetId) return;
         try {
+            const rec = currentRecords.find(r => Number(r.id) === Number(deleteTargetId));
             await apiFetch(`${API}?id=${deleteTargetId}`, { method: 'DELETE' });
             showToast('Record deleted.', 'success');
             closeDeleteModal();
+            if (rec) queueUndoForDeleted([extractRecordPayload(rec)]);
             loadRecords();
         } catch {
             // error toasted
         }
+    }
+
+    function extractRecordPayload(record) {
+        return {
+            artist: record.artist || '',
+            album: record.album || '',
+            year: record.year || null,
+            genre: record.genre || '',
+            format: record.format || 'Vinyl',
+            condition_grade: record.condition_grade || '',
+            notes: record.notes || '',
+            cover_url: record.cover_url || '',
+        };
+    }
+
+    function queueUndoForDeleted(records) {
+        if (!records.length) return;
+
+        lastDeletedPayloads = records;
+        $undoText.textContent = `${records.length} record${records.length !== 1 ? 's' : ''} deleted.`;
+        $undoBar.classList.remove('hidden');
+
+        if (undoDeleteTimer) clearTimeout(undoDeleteTimer);
+        undoDeleteTimer = setTimeout(() => {
+            hideUndoBar();
+        }, 12000);
+    }
+
+    function hideUndoBar() {
+        if (undoDeleteTimer) {
+            clearTimeout(undoDeleteTimer);
+            undoDeleteTimer = null;
+        }
+        $undoBar.classList.add('hidden');
+        lastDeletedPayloads = null;
+    }
+
+    async function handleUndoDelete() {
+        if (!lastDeletedPayloads || !lastDeletedPayloads.length) return;
+
+        const payloads = [...lastDeletedPayloads];
+        const $undoBtn = document.getElementById('btnUndoDelete');
+        const label = $undoBtn.textContent;
+        $undoBtn.disabled = true;
+        $undoBtn.textContent = 'Restoring...';
+
+        let restored = 0;
+        for (const payload of payloads) {
+            try {
+                await apiFetch(`${API}?force=1`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                restored++;
+            } catch {
+                // Continue restoring remaining records.
+            }
+        }
+
+        if (restored > 0) {
+            invalidateAllRecordsCache();
+            showToast(`${restored} record${restored !== 1 ? 's' : ''} restored.`, 'success');
+            loadRecords();
+        } else {
+            showToast('Unable to restore deleted records.', 'error');
+        }
+
+        $undoBtn.disabled = false;
+        $undoBtn.textContent = label;
+        hideUndoBar();
     }
 
     // ── Selection helpers ─────────────────────────────────────
@@ -609,35 +891,54 @@
     // ── CSV Import ──────────────────────────────────────────
     function openImportModal() {
         csvParsedRows = [];
+        csvPreviewRows = [];
+        csvImportIssues = [];
         $csvFileInput.value = '';
         $importPreview.classList.add('hidden');
         $btnConfirmImport.classList.add('hidden');
+        $importErrors.classList.add('hidden');
+        $importErrors.innerHTML = '';
         $importOverlay.classList.remove('hidden');
     }
 
     function closeImportModal() {
         $importOverlay.classList.add('hidden');
         csvParsedRows = [];
+        csvPreviewRows = [];
+        csvImportIssues = [];
+        $importErrors.classList.add('hidden');
+        $importErrors.innerHTML = '';
     }
 
     function parseCsvFile(file) {
         const reader = new FileReader();
         reader.onload = e => {
             const text = e.target.result;
-            const rows = parseCsv(text);
-            if (!rows.length) {
+            const parsed = parseCsv(text);
+            csvParsedRows = parsed.validRows;
+            csvPreviewRows = parsed.previewRows;
+            csvImportIssues = parsed.errors;
+
+            if (!parsed.previewRows.length) {
                 showToast('CSV file is empty or has no data rows.', 'error');
                 return;
             }
-            csvParsedRows = rows;
-            renderCsvPreview(rows);
+
+            renderCsvPreview(parsed);
+            renderImportErrors(parsed.errors);
+
+            if (!parsed.validRows.length) {
+                showToast('No valid rows found. Fix the CSV and try again.', 'error');
+            }
         };
         reader.readAsText(file);
     }
 
     function parseCsv(text) {
         const lines = text.split(/\r?\n/).filter(l => l.trim());
-        if (lines.length < 2) return [];
+        if (lines.length < 2) {
+            return { validRows: [], previewRows: [], errors: ['CSV must include a header row and at least one data row.'], totalRows: 0 };
+        }
 
         const headerLine = lines[0];
         const headers = parseCsvLine(headerLine).map(h => h.trim().toLowerCase().replace(/\s+/g, '_'));
@@ -656,8 +957,18 @@
         const mappedHeaders = headers.map(h => aliasMap[h] || h);
         const validFields = ['artist', 'album', 'year', 'genre', 'format', 'condition_grade', 'notes', 'cover_url'];
 
-        const rows = [];
+        const errors = [];
+        if (!mappedHeaders.includes('artist') || !mappedHeaders.includes('album')) {
+            errors.push('Header must include both artist and album columns.');
+            return { validRows: [], previewRows: [], errors, totalRows: lines.length - 1 };
+        }
+
+        const validRows = [];
+        const previewRows = [];
+        const seenInFile = new Set();
+
         for (let i = 1; i < lines.length; i++) {
+            const rowNumber = i + 1;
             const values = parseCsvLine(lines[i]);
             const obj = {};
             mappedHeaders.forEach((h, idx) => {
@@ -665,16 +976,77 @@
                     obj[h] = (values[idx] || '').trim();
                 }
             });
-            // Default condition_grade to Mint if not provided
+
+            const artist = (obj.artist || '').trim();
+            const album = (obj.album || '').trim();
+            const rawFormat = (obj.format || 'Vinyl').trim();
+            const format = IMPORT_VALID_FORMATS.includes(rawFormat) ? rawFormat : 'Vinyl';
+
+            let rowError = '';
+            if (!artist || !album) {
+                rowError = `Row ${rowNumber}: artist and album are required.`;
+            }
+
+            let year = null;
+            if (!rowError && obj.year) {
+                const parsedYear = Number(obj.year);
+                const maxYear = new Date().getFullYear() + 1;
+                if (!Number.isInteger(parsedYear) || parsedYear < 1900 || parsedYear > maxYear) {
+                    rowError = `Row ${rowNumber}: year must be between 1900 and ${maxYear}.`;
+                } else {
+                    year = parsedYear;
+                }
+            }
+
+            const dedupeKey = `${normalizeDuplicateValue(artist)}|${normalizeDuplicateValue(album)}|${normalizeDuplicateValue(format)}`;
+            if (!rowError && seenInFile.has(dedupeKey)) {
+                rowError = `Row ${rowNumber}: duplicate found inside this CSV file.`;
+            }
+
+            if (!rowError) {
+                seenInFile.add(dedupeKey);
+            }
+
             if (!obj.condition_grade) {
                 obj.condition_grade = 'Mint (M)';
             }
-            // Only include rows that have at least artist or album
-            if (obj.artist || obj.album) {
-                rows.push(obj);
+
+            const cleaned = {
+                artist,
+                album,
+                year,
+                genre: (obj.genre || '').trim(),
+                format,
+                condition_grade: (obj.condition_grade || '').trim() || 'Mint (M)',
+                notes: (obj.notes || '').trim(),
+                cover_url: (obj.cover_url || '').trim(),
+            };
+
+            previewRows.push({
+                rowNumber,
+                row: cleaned,
+                status: rowError ? 'error' : 'ok',
+                message: rowError || (rawFormat !== format ? `Row ${rowNumber}: unsupported format changed to Vinyl.` : 'Ready'),
+            });
+
+            if (rowError) {
+                errors.push(rowError);
+                continue;
             }
+
+            if (rawFormat !== format) {
+                errors.push(`Row ${rowNumber}: unsupported format "${rawFormat}" changed to Vinyl.`);
+            }
+
+            validRows.push(cleaned);
         }
-        return rows;
+
+        return {
+            validRows,
+            previewRows,
+            errors,
+            totalRows: lines.length - 1,
+        };
     }
 
     function parseCsvLine(line) {
@@ -707,19 +1079,61 @@
         return result;
     }
 
-    function renderCsvPreview(rows) {
-        const maxPreview = 10;
-        const cols = ['artist', 'album', 'year', 'genre', 'format'];
+    function renderCsvPreview(parsed) {
+        const maxPreview = 12;
+        const cols = ['artist', 'album', 'year', 'genre', 'format', 'status'];
+
         let html = '<thead><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
-        rows.slice(0, maxPreview).forEach(r => {
-            html += '<tr>' + cols.map(c => `<td>${escHtml(r[c] || '')}</td>`).join('') + '</tr>';
+        parsed.previewRows.slice(0, maxPreview).forEach(item => {
+            const r = item.row;
+            html += `<tr class="${item.status === 'ok' ? 'import-ok' : 'import-error'}">`;
+            html += `<td>${escHtml(r.artist || '')}</td>`;
+            html += `<td>${escHtml(r.album || '')}</td>`;
+            html += `<td>${escHtml(r.year || '')}</td>`;
+            html += `<td>${escHtml(r.genre || '')}</td>`;
+            html += `<td>${escHtml(r.format || '')}</td>`;
+            html += `<td>${item.status === 'ok' ? 'OK' : 'Invalid'}</td>`;
+            html += '</tr>';
         });
         html += '</tbody>';
+
         $previewTable.innerHTML = html;
-        $previewTitle.textContent = `Preview — ${rows.length} record${rows.length !== 1 ? 's' : ''} found${rows.length > maxPreview ? ` (showing first ${maxPreview})` : ''}`;
+        $previewTitle.textContent = `Preview — ${parsed.validRows.length} valid of ${parsed.totalRows} row${parsed.totalRows !== 1 ? 's' : ''}`;
         $importPreview.classList.remove('hidden');
-        $btnConfirmImport.classList.remove('hidden');
-        $btnConfirmImport.textContent = `Import ${rows.length} Record${rows.length !== 1 ? 's' : ''}`;
+
+        if (parsed.validRows.length > 0) {
+            $btnConfirmImport.classList.remove('hidden');
+            $btnConfirmImport.disabled = false;
+            $btnConfirmImport.textContent = `Import ${parsed.validRows.length} Record${parsed.validRows.length !== 1 ? 's' : ''}`;
+        } else {
+            $btnConfirmImport.classList.remove('hidden');
+            $btnConfirmImport.disabled = true;
+            $btnConfirmImport.textContent = 'No Valid Rows to Import';
+        }
+    }
+
+    function renderImportErrors(errors) {
+        if (!errors.length) {
+            $importErrors.classList.add('hidden');
+            $importErrors.innerHTML = '';
+            return;
+        }
+
+        const maxErrors = 8;
+        const shown = errors.slice(0, maxErrors);
+        const extra = errors.length - shown.length;
+
+        let html = `<h4>Import issues (${errors.length})</h4><ul>`;
+        shown.forEach(err => {
+            html += `<li>${escHtml(err)}</li>`;
+        });
+        if (extra > 0) {
+            html += `<li>...and ${extra} more issue${extra !== 1 ? 's' : ''}.</li>`;
+        }
+        html += '</ul>';
+
+        $importErrors.innerHTML = html;
+        $importErrors.classList.remove('hidden');
     }
 
     async function handleCsvImport() {
@@ -734,10 +1148,18 @@
                 body: JSON.stringify({ rows: csvParsedRows }),
             });
             const data = await res.json();
+            if (!res.ok) {
+                renderImportErrors(data.errors || []);
+                throw new Error(data.error || data.message || 'Import request failed.');
+            }
+            renderImportErrors(data.errors || []);
             if (data.imported > 0) {
-                showToast(`${data.imported} of ${data.total} records imported!`, 'success');
-                closeImportModal();
+                showToast(`${data.imported} of ${data.total} records imported.`, 'success');
+                invalidateAllRecordsCache();
                 loadRecords();
+                if (!data.skipped) {
+                    closeImportModal();
+                }
             } else {
                 showToast(data.message || 'No records imported.', 'error');
             }
@@ -792,10 +1214,53 @@
             a.download = `my-records-backup-${date}.csv`;
             a.click();
             URL.revokeObjectURL(a.href);
+            localStorage.setItem('recordsLastBackupAt', String(Date.now()));
+            dismissBackupReminder(true);
             showToast(`Exported ${records.length} record${records.length !== 1 ? 's' : ''} to CSV.`, 'success');
         } catch {
             // error already toasted by apiFetch
         }
+    }
+
+    function handleBackupNow() {
+        handleExportCsv();
+    }
+
+    function dismissBackupReminder(permanent = false) {
+        $backupReminder.classList.add('hidden');
+        if (permanent) {
+            localStorage.removeItem('recordsBackupReminderDismissedAt');
+            return;
+        }
+        localStorage.setItem('recordsBackupReminderDismissedAt', String(Date.now()));
+    }
+
+    function maybeShowBackupReminder(recordCount = currentRecords.length) {
+        if (!recordCount) {
+            $backupReminder.classList.add('hidden');
+            return;
+        }
+
+        const now = Date.now();
+        const lastBackupAt = Number(localStorage.getItem('recordsLastBackupAt') || 0);
+        const dismissedAt = Number(localStorage.getItem('recordsBackupReminderDismissedAt') || 0);
+        const reminderMs = BACKUP_REMINDER_DAYS * 24 * 60 * 60 * 1000;
+
+        if (dismissedAt && (now - dismissedAt) < reminderMs / 2) {
+            $backupReminder.classList.add('hidden');
+            return;
+        }
+
+        if (lastBackupAt && (now - lastBackupAt) < reminderMs) {
+            $backupReminder.classList.add('hidden');
+            return;
+        }
+
+        const daysText = lastBackupAt
+            ? `${Math.floor((now - lastBackupAt) / (24 * 60 * 60 * 1000))} day${Math.floor((now - lastBackupAt) / (24 * 60 * 60 * 1000)) !== 1 ? 's' : ''} ago`
+            : 'never';
+        $backupReminderText.textContent = `Backup reminder: your last export was ${daysText}.`;
+        $backupReminder.classList.remove('hidden');
     }
 
     // ── Stats ───────────────────────────────────────────────
@@ -926,9 +1391,25 @@
             // Top cards
             html += '<div class="stats-grid">';
             html += statCard(s.total, 'Total Records');
+            html += statCard(s.by_artist?.length || 0, 'Artists');
             html += statCard(s.by_genre?.length || 0, 'Genres');
             html += statCard(s.by_format?.length || 0, 'Formats');
             html += '</div>';
+
+            // Most collected artists
+            if (s.by_artist?.length) {
+                const max = s.by_artist[0].count;
+                html += '<div class="stats-section"><h3>Most Collected Artists</h3><ul class="stats-bar-list">';
+                s.by_artist.forEach(a => {
+                    const pct = Math.round((a.count / max) * 100);
+                    html += `<li class="stats-bar-item">
+                        <span class="stats-bar-label">${escHtml(a.artist || 'Unknown')}</span>
+                        <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${pct}%"></span></span>
+                        <span class="stats-bar-count">${a.count}</span>
+                    </li>`;
+                });
+                html += '</ul></div>';
+            }
 
             // Genre breakdown
             if (s.by_genre?.length) {
@@ -960,6 +1441,37 @@
                 html += '</ul></div>';
             }
 
+            // Year distribution (recent years)
+            if (s.by_year?.length) {
+                const max = s.by_year.reduce((m, y) => Math.max(m, y.count), 0);
+                const recent = s.by_year.slice(-12);
+                html += '<div class="stats-section"><h3>Year Distribution</h3><ul class="stats-bar-list">';
+                recent.forEach(y => {
+                    const pct = Math.round((y.count / max) * 100);
+                    html += `<li class="stats-bar-item">
+                        <span class="stats-bar-label">${y.year}</span>
+                        <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${pct}%"></span></span>
+                        <span class="stats-bar-count">${y.count}</span>
+                    </li>`;
+                });
+                html += '</ul></div>';
+            }
+
+            // Condition breakdown
+            if (s.by_condition?.length) {
+                const max = s.by_condition[0].count;
+                html += '<div class="stats-section"><h3>Condition Breakdown</h3><ul class="stats-bar-list">';
+                s.by_condition.forEach(c => {
+                    const pct = Math.round((c.count / max) * 100);
+                    html += `<li class="stats-bar-item">
+                        <span class="stats-bar-label">${escHtml(c.condition || 'Unknown')}</span>
+                        <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${pct}%"></span></span>
+                        <span class="stats-bar-count">${c.count}</span>
+                    </li>`;
+                });
+                html += '</ul></div>';
+            }
+
             // By decade
             if (s.by_decade?.length) {
                 const max = s.by_decade.reduce((m, d) => Math.max(m, d.count), 0);
@@ -970,6 +1482,19 @@
                         <span class="stats-bar-label">${d.decade}s</span>
                         <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${pct}%"></span></span>
                         <span class="stats-bar-count">${d.count}</span>
+                    </li>`;
+                });
+                html += '</ul></div>';
+            }
+
+            // Growth timeline
+            if (s.growth?.length) {
+                html += '<div class="stats-section"><h3>Collection Growth (Last 12 Months)</h3><ul class="stats-growth-list">';
+                s.growth.forEach(g => {
+                    html += `<li class="stats-growth-item">
+                        <div class="stats-growth-month">${formatMonthLabel(g.month)}</div>
+                        <div class="stats-growth-count">+${g.added}</div>
+                        <div class="stats-growth-total">Total ${g.total}</div>
                     </li>`;
                 });
                 html += '</ul></div>';
@@ -1005,17 +1530,57 @@
         }
     }
 
+    function formatMonthLabel(monthKey) {
+        if (!monthKey || !/^\d{4}-\d{2}$/.test(monthKey)) return monthKey || '';
+        const [year, month] = monthKey.split('-').map(Number);
+        const d = new Date(year, month - 1, 1);
+        return d.toLocaleDateString(undefined, { month: 'short', year: '2-digit' });
+    }
+
     function statCard(value, label) {
         return `<div class="stat-card"><div class="stat-value">${value}</div><div class="stat-label">${label}</div></div>`;
     }
 
+    function formatApiErrorMessage(err) {
+        if (!err || !err.status) {
+            return err?.message || 'Network error. Please check your connection and retry.';
+        }
+
+        const base = err.message || 'Request failed.';
+        const requestIdSuffix = err.requestId ? ` (Ref: ${err.requestId})` : '';
+
+        if (err.status === 429) {
+            return `Too many requests. Please wait a moment and try again.${requestIdSuffix}`;
+        }
+        if (err.status >= 500) {
+            return `Server error. Please try again soon.${requestIdSuffix}`;
+        }
+        if (err.status === 404) {
+            return `Requested item was not found.${requestIdSuffix}`;
+        }
+        if (err.status === 413) {
+            return `The request was too large. Try fewer rows or a smaller file.${requestIdSuffix}`;
+        }
+        return `${base}${requestIdSuffix}`;
+    }
+
     // ── Toast ───────────────────────────────────────────────
-    function showToast(msg, type = '') {
+    function showToast(msg, type = '', durationMs = 3200) {
+        if (toastTimer) {
+            clearTimeout(toastTimer);
+            toastTimer = null;
+        }
+
         $toast.textContent = msg;
         $toast.className = 'toast';
         if (type) $toast.classList.add(`toast-${type}`);
+        $toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
         $toast.classList.remove('hidden');
-        setTimeout(() => $toast.classList.add('hidden'), 3000);
+
+        toastTimer = setTimeout(() => {
+            $toast.classList.add('hidden');
+            toastTimer = null;
+        }, durationMs);
     }
 
     // ── Utils ───────────────────────────────────────────────

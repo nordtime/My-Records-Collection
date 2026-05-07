@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>💿 My Records Collection</title>
+    <link rel="icon" href="favicon.ico" type="image/x-icon">
     <link rel="stylesheet" href="css/style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -24,7 +25,6 @@
         </div>
     </header>
 
-                <link rel="icon" href="favicon.ico" type="image/x-icon">
     <!-- ── Toolbar ───────────────────────────────────────── -->
     <section class="toolbar">
         <div class="toolbar-inner">
@@ -54,11 +54,18 @@
                 <button class="btn btn-primary" id="btnAdd">&#43; Add Record</button>
             </div>
         </div>
+        <div class="backup-reminder hidden" id="backupReminder" role="status" aria-live="polite">
+            <p id="backupReminderText"></p>
+            <div class="backup-reminder-actions">
+                <button class="btn btn-primary btn-sm" id="btnBackupNow">Backup Now</button>
+                <button class="btn btn-ghost btn-sm" id="btnDismissBackupReminder" aria-label="Dismiss backup reminder">Dismiss</button>
+            </div>
+        </div>
     </section>
 
     <!-- ── Records Grid ──────────────────────────────────── -->
     <main class="main-content">
-        <div class="records-count" id="recordsCount"></div>
+        <div class="records-count" id="recordsCount" aria-live="polite"></div>
         <div class="records-grid" id="recordsGrid">
             <!-- Cards injected by JS -->
         </div>
@@ -75,7 +82,7 @@
         <div class="modal">
             <div class="modal-header">
                 <h2 id="modalTitle">Add Record</h2>
-                <button class="btn-close" id="btnCloseModal">&times;</button>
+                <button class="btn-close" id="btnCloseModal" aria-label="Close add record modal">&times;</button>
             </div>
             <form id="recordForm" class="record-form">
                 <input type="hidden" id="recordId">
@@ -100,6 +107,7 @@
                     <span class="lookup-status hidden" id="lookupStatus"></span>
                 </div>
                 <div class="lookup-results hidden" id="lookupResults"></div>
+                <div class="form-alert form-alert-warning hidden" id="duplicateHint" role="status" aria-live="polite"></div>
                 <div class="form-row">
                     <div class="form-group">
                         <label for="year">Year</label>
@@ -134,14 +142,19 @@
                         </select>
                     </div>
                 </div>
-                <div class="form-group">
-                    <label for="coverUrl">Cover Image URL</label>
-                    <input type="text" id="coverUrl" class="input" placeholder="https://…">
-                </div>
-                <div class="form-group">
-                    <label for="notes">Notes</label>
-                    <textarea id="notes" class="input textarea" rows="3" placeholder="First pressing, signed copy…"></textarea>
-                </div>
+                <details class="form-details" id="optionalDetails">
+                    <summary>Optional Details</summary>
+                    <div class="form-details-body">
+                        <div class="form-group">
+                            <label for="coverUrl">Cover Image URL</label>
+                            <input type="text" id="coverUrl" class="input" placeholder="https://…">
+                        </div>
+                        <div class="form-group">
+                            <label for="notes">Notes</label>
+                            <textarea id="notes" class="input textarea" rows="3" placeholder="First pressing, signed copy…"></textarea>
+                        </div>
+                    </div>
+                </details>
                 <div class="form-actions">
                     <button type="button" class="btn btn-ghost" id="btnCancel">Cancel</button>
                     <button type="submit" class="btn btn-primary" id="btnSave">Save Record</button>
@@ -155,7 +168,7 @@
         <div class="modal modal-wide">
             <div class="modal-header">
                 <h2 id="tracklistTitle">Track List</h2>
-                <button class="btn-close" id="btnCloseTracklist">&times;</button>
+                <button class="btn-close" id="btnCloseTracklist" aria-label="Close track list">&times;</button>
             </div>
             <div class="tracklist-body" id="tracklistBody">
                 <p class="loading">Loading tracks…</p>
@@ -168,7 +181,7 @@
         <div class="modal modal-wide">
             <div class="modal-header">
                 <h2>Collection Statistics</h2>
-                <button class="btn-close" id="btnCloseStats">&times;</button>
+                <button class="btn-close" id="btnCloseStats" aria-label="Close statistics">&times;</button>
             </div>
             <div class="stats-body" id="statsBody">
                 <p class="loading">Loading statistics…</p>
@@ -181,7 +194,7 @@
         <div class="modal modal-sm">
             <div class="modal-header">
                 <h2 id="discogsTitle">Discogs Value</h2>
-                <button class="btn-close" id="btnCloseDiscogs">&times;</button>
+                <button class="btn-close" id="btnCloseDiscogs" aria-label="Close Discogs value">&times;</button>
             </div>
             <div class="discogs-body" id="discogsBody">
                 <p class="loading">Looking up value…</p>
@@ -201,7 +214,7 @@
         <div class="modal modal-sm">
             <div class="modal-header">
                 <h2>Delete Record</h2>
-                <button class="btn-close" id="btnCloseDelete">&times;</button>
+                <button class="btn-close" id="btnCloseDelete" aria-label="Close delete confirmation">&times;</button>
             </div>
             <p class="delete-msg">Are you sure you want to delete <strong id="deleteName"></strong>? This cannot be undone.</p>
             <div class="form-actions">
@@ -216,7 +229,7 @@
         <div class="modal modal-sm">
             <div class="modal-header">
                 <h2>Import from CSV</h2>
-                <button class="btn-close" id="btnCloseImport">&times;</button>
+                <button class="btn-close" id="btnCloseImport" aria-label="Close CSV import">&times;</button>
             </div>
             <div class="import-body">
                 <p class="import-desc">Upload a CSV file with columns:<br>
@@ -233,6 +246,7 @@
                     <div class="preview-table-wrap">
                         <table class="preview-table" id="previewTable"></table>
                     </div>
+                    <div class="import-errors hidden" id="importErrors" aria-live="polite"></div>
                 </div>
                 <div class="form-actions">
                     <button class="btn btn-ghost" id="btnCancelImport">Cancel</button>
@@ -243,7 +257,14 @@
     </div>
 
     <!-- ── Toast Notification ────────────────────────────── -->
-    <div class="toast hidden" id="toast"></div>
+    <div class="toast hidden" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- ── Undo Delete ───────────────────────────────────── -->
+    <div class="undo-bar hidden" id="undoBar" role="status" aria-live="polite" aria-atomic="true">
+        <span id="undoText"></span>
+        <button class="btn btn-ghost btn-sm" id="btnUndoDelete">Undo</button>
+        <button class="btn btn-ghost btn-sm" id="btnDismissUndo" aria-label="Dismiss undo prompt">Dismiss</button>
+    </div>
 
     <footer class="app-footer">
         <p>&copy; 2026 My Records Collection</p>
